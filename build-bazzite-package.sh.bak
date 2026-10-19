@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: build-bazzite-package.sh SOURCE.py [ASSETS_DIR] [OUTPUT_DIR]
+Builds a self-contained PyInstaller folder and tarball using Fedora in Podman.
+USAGE
+  exit 2
+}
+[[ $# -ge 1 && $# -le 3 ]] || usage
+
+SOURCE="$(realpath -- "$1")"
+ASSETS="${2:-}"
+OUT="$(realpath -m -- "${3:-$PWD/dist}")"
+command -v podman >/dev/null || { echo 'podman is required on Bazzite.' >&2; exit 3; }
+[[ -f "$SOURCE" ]] || { echo "Source not found: $SOURCE" >&2; exit 1; }
+[[ -z "$ASSETS" || -d "$ASSETS" ]] || { echo "Assets directory not found: $ASSETS" >&2; exit 1; }
+mkdir -p "$OUT"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/input" "$WORK/out"
+cp -- "$SOURCE" "$WORK/input/IndexCompt.py"
+if [[ -n "$ASSETS" ]]; then cp -a -- "$ASSETS" "$WORK/input/assets"; fi
+
+# Patch only the staged copy: the uploaded/original source is never modified.
+python3 - "$WORK/input/IndexCompt.py" <<'PY'
+from pathlib import Path
+p = Path(__import__('sys').argv[1])
+s = p.read_text(encoding='utf-8')
+old = '''BASE_DIR = os.path.dirname(os.path.abspath(__file__))\nENERGY_FILE = os.path.join(BASE_DIR, "energy_data.json")\nEXCEL_FILE = os.path.join(BASE_DIR, "export_consommation.xlsx")'''
+new = '''BASE_DIR = os.path.dirname(os.path.abspath(__file__))\n# Keep personal data outside the PyInstaller bundle (_MEIPASS).\nDATA_DIR = os.path.abspath(os.environ.get(\n    "INDEXCOMPT_DATA_DIR",\n    os.path.join(os.path.expanduser("~"), ".local", "share", "IndexCompt"),\n))\nos.makedirs(DATA_DIR, exist_ok=True)\nENERGY_FILE = os.path.join(DATA_DIR, "energy_data.json")\nEXCEL_FILE = os.path.join(DATA_DIR, "export_consommation.xlsx")'''
+if s.count(old) != 1:
+    raise SystemExit('Expected persistence block not found exactly once; refusing to patch.')
+p.write_text(s.replace(old, new), encoding='utf-8')
+PY
+
+podman run --rm --userns=keep-id \
+  -v "$WORK/input:/src:ro" -v "$WORK/out:/out:rw" \
+  fedora:latest bash -lc '
+    set -eux
+    dnf -y install python3 python3-pip python3-tkinter python3-devel gcc make \
+      mesa-libGL libX11 libXext libXrender libXfixes fontconfig freetype \
+      cabextract || true
+    python3 -m pip install --no-cache-dir --disable-pip-version-check \
+      pyinstaller matplotlib pandas openpyxl
+    python3 -m py_compile /src/IndexCompt.py
+    mkdir -p /tmp/build
+    cd /src
+    ADD_DATA=()
+    if [[ -d /src/assets ]]; then ADD_DATA+=(--add-data /src/assets:assets); fi
+    python3 -m PyInstaller --noconfirm --clean --onedir --windowed \
+      --name IndexCompt --paths /src \
+      --collect-all matplotlib --collect-all pandas \
+      --collect-all openpyxl \
+      "${ADD_DATA[@]}" \
+      /src/IndexCompt.py
+    cp -a /src/dist/IndexCompt /out/
+  '
+
+APP="$WORK/package/IndexCompt-Bazzite"
+mkdir -p "$APP"
+cp -a "$WORK/out/IndexCompt" "$APP/"
+cp -- "$(dirname -- "$0")/run-indexcompt.sh" "$APP/"
+cp -- "$(dirname -- "$0")/README.md" "$APP/"
+chmod +x "$APP/run-indexcompt.sh"
+rm -rf "$OUT/IndexCompt-Bazzite" "$OUT/IndexCompt-Bazzite.tar.gz"
+cp -a "$APP" "$OUT/IndexCompt-Bazzite"
+tar -C "$OUT" -czf "$OUT/IndexCompt-Bazzite.tar.gz" IndexCompt-Bazzite
+printf 'Built: %s\n' "$OUT/IndexCompt-Bazzite.tar.gz"
