@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Relevés personnels et exports
+energy_data.json
+*.xlsx
+
+# Configuration PyCharm
+.idea/
